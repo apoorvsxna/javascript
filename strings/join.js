@@ -334,6 +334,57 @@ export const getLayoutedElements = (nodes, edges, direction = 'TB') => {
     }
   });
 
+  const levelValues = Array.from(levels.values());
+  const maxLevel = Math.max(...levelValues);
+  const minLevel = Math.min(...levelValues);
+
+  const sortedLevelValues = [...levelValues].sort((a, b) => a - b);
+  const p95Index = Math.floor(sortedLevelValues.length * 0.95); 
+  const p95Level = sortedLevelValues[p95Index];
+
+  console.log(`[Job Service] Level stats: min=${minLevel}, max=${maxLevel}, 95th percentile=${p95Level}`);
+
+  const hasOutliers = maxLevel > p95Level * 2;
+
+  if (hasOutliers) {
+    console.warn(`[Job Service] Detected outlier levels (max=${maxLevel} vs p95=${p95Level}), normalizing...`);
+
+    const compressionThreshold = p95Level + 5; 
+    const maxReasonableLevel = compressionThreshold + 10; 
+
+    nodes.forEach(node => {
+      const currentLevel = levels.get(node.id);
+
+      if (currentLevel <= compressionThreshold) {
+
+        levels.set(node.id, currentLevel);
+      } else {
+
+        const outlierRange = maxLevel - compressionThreshold;
+        const targetRange = maxReasonableLevel - compressionThreshold;
+        const relativePosition = (currentLevel - compressionThreshold) / outlierRange;
+        const compressedLevel = compressionThreshold + Math.floor(relativePosition * targetRange);
+
+        levels.set(node.id, compressedLevel);
+      }
+    });
+
+    console.log(`[Job Service] Compressed outliers into range [${compressionThreshold}, ${maxReasonableLevel}]`);
+  } else {
+
+    const maxReasonableLevel = Math.min(Math.ceil(nodes.length / 5), 50);
+
+    if (maxLevel > maxReasonableLevel) {
+      console.warn(`[Job Service] Max level ${maxLevel} exceeds reasonable limit, compressing to ${maxReasonableLevel}`);
+
+      nodes.forEach(node => {
+        const currentLevel = levels.get(node.id);
+        const normalizedLevel = Math.floor((currentLevel / maxLevel) * maxReasonableLevel);
+        levels.set(node.id, normalizedLevel);
+      });
+    }
+  }
+
   const nodesByLevel = new Map();
   nodes.forEach(node => {
     const level = levels.get(node.id);
@@ -344,6 +395,13 @@ export const getLayoutedElements = (nodes, edges, direction = 'TB') => {
   });
 
   const sortedLevels = Array.from(nodesByLevel.keys()).sort((a, b) => a - b);
+  console.log(`[Job Service] Jobs distributed across ${sortedLevels.length} levels (0-${Math.max(...sortedLevels)})`);
+
+  const levelDistribution = sortedLevels.map(level => ({
+    level,
+    count: nodesByLevel.get(level).length
+  }));
+  console.log(`[Job Service] Level distribution:`, levelDistribution.slice(0, 10).map(l => `L${l.level}:${l.count}`).join(', '));
 
   const optimizeNodeOrdering = () => {
 

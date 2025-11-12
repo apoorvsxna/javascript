@@ -1,540 +1,485 @@
-import { getJobsData } from '../models/jobModel.js';
+import fs from 'fs';
+import path from 'path';
+import { XMLParser } from 'fast-xml-parser';
+import sax from 'sax';
 
-export const getAllJobsWithLayout = async (direction = 'TB') => {
+const STREAMING_THRESHOLD = 100 * 1024 * 1024; 
+
+const JOB_STATUSES = ['success', 'failed', 'running', 'waiting', 'idle'];
+
+const getRandomStatus = () => {
+  return JOB_STATUSES[Math.floor(Math.random() * JOB_STATUSES.length)];
+};
+
+export const parseControlMXml = async (filePath) => {
   try {
-    console.log(`[Job Service] Getting all jobs with layout (direction: ${direction})`);
-    const jobsData = await getJobsData();
-    console.log(`[Job Service] Retrieved ${jobsData.length} jobs from data source`);
+    console.log(`[XML Parser] Starting to parse: ${filePath}`);
+    const startTime = Date.now();
 
-    const { nodes, edges } = transformJobsToFlowData(jobsData);
-    console.log(`[Job Service] Transformed to ${nodes.length} nodes and ${edges.length} edges`);
+    const stats = await fs.promises.stat(filePath);
+    const fileSizeMB = (stats.size / (1024 * 1024)).toFixed(2);
+    console.log(`[XML Parser] File size: ${fileSizeMB}MB`);
 
-    const layoutedNodes = getLayoutedElements(nodes, edges, direction);
-    console.log(`[Job Service] Layout complete, returning ${layoutedNodes.length} nodes`);
+    let jobs;
 
-    return {
-      nodes: layoutedNodes,
-      edges,
-      totalJobs: jobsData.length
-    };
+    if (stats.size >= STREAMING_THRESHOLD) {
+      console.log(`[XML Parser] Using streaming parser (file >= 100MB)`);
+      jobs = await parseControlMXmlStreaming(filePath);
+    } else {
+      console.log(`[XML Parser] Using fast parser (file < 100MB)`);
+      jobs = await parseControlMXmlFast(filePath);
+    }
+
+    const endTime = Date.now();
+    console.log(`[XML Parser] Parsed ${jobs.length} jobs in ${endTime - startTime}ms`);
+
+    return jobs;
   } catch (error) {
-    console.error('[Job Service] Error in getAllJobsWithLayout:', error);
-    throw error;
+    console.error('[XML Parser] Error parsing XML:', error);
+    throw new Error(`Failed to parse XML file: ${error.message}`);
   }
 };
 
-export const searchJobs = async (query, direction = 'TB') => {
-  const jobsData = await getJobsData();
-  const { nodes, edges } = transformJobsToFlowData(jobsData);
+const parseControlMXmlFast = async (filePath) => {
 
-  const queryLower = query.toLowerCase();
-  const filteredNodes = nodes.filter((node) =>
-    node.data.label.toLowerCase().includes(queryLower)
-  );
+  const xmlData = await fs.promises.readFile(filePath, 'utf8');
 
-  const filteredNodeIds = new Set(filteredNodes.map((n) => n.id));
-  const filteredEdges = edges.filter(
-    (edge) => filteredNodeIds.has(edge.source) && filteredNodeIds.has(edge.target)
-  );
-
-  const layoutedNodes = getLayoutedElements(filteredNodes, filteredEdges, direction);
-
-  return {
-    nodes: layoutedNodes,
-    edges: filteredEdges,
-    totalJobs: jobsData.length,
-    matchedJobs: filteredNodes.length
-  };
-};
-
-export const filterJobsByStatus = async (statusFilters, direction = 'TB') => {
-  const jobsData = await getJobsData();
-  const { nodes, edges } = transformJobsToFlowData(jobsData);
-
-  const statusSet = new Set(statusFilters);
-  const filteredNodes = nodes.filter((node) => statusSet.has(node.data.status));
-
-  const filteredNodeIds = new Set(filteredNodes.map((n) => n.id));
-  const filteredEdges = edges.filter(
-    (edge) => filteredNodeIds.has(edge.source) && filteredNodeIds.has(edge.target)
-  );
-
-  const layoutedNodes = getLayoutedElements(filteredNodes, filteredEdges, direction);
-
-  return {
-    nodes: layoutedNodes,
-    edges: filteredEdges,
-    totalJobs: jobsData.length,
-    filteredJobs: filteredNodes.length
-  };
-};
-
-export const filterJobsAdvanced = async (filters, direction = 'TB') => {
-  const jobsData = await getJobsData();
-  const { nodes, edges } = transformJobsToFlowData(jobsData);
-
-  let filteredNodes = nodes;
-
-  if (filters.status && filters.status.length > 0) {
-    const statusSet = new Set(filters.status);
-    filteredNodes = filteredNodes.filter((node) => statusSet.has(node.data.status));
-  }
-
-  if (filters.application && filters.application.length > 0) {
-    const applicationSet = new Set(filters.application);
-    filteredNodes = filteredNodes.filter((node) => applicationSet.has(node.data.application));
-  }
-
-  if (filters.subApplication && filters.subApplication.length > 0) {
-    const subApplicationSet = new Set(filters.subApplication);
-    filteredNodes = filteredNodes.filter((node) => subApplicationSet.has(node.data.subApplication));
-  }
-
-  if (filters.smartFolder && filters.smartFolder.length > 0) {
-    const smartFolderSet = new Set(filters.smartFolder);
-    filteredNodes = filteredNodes.filter((node) => smartFolderSet.has(node.data.smartFolder));
-  }
-
-  const filteredNodeIds = new Set(filteredNodes.map((n) => n.id));
-  const filteredEdges = edges.filter(
-    (edge) => filteredNodeIds.has(edge.source) && filteredNodeIds.has(edge.target)
-  );
-
-  const layoutedNodes = getLayoutedElements(filteredNodes, filteredEdges, direction);
-
-  return {
-    nodes: layoutedNodes,
-    edges: filteredEdges,
-    totalJobs: jobsData.length,
-    filteredJobs: filteredNodes.length
-  };
-};
-
-export const getFilterOptions = async () => {
-  const jobsData = await getJobsData();
-
-  const applications = new Set();
-  const subApplications = new Set();
-  const smartFolders = new Set();
-
-  jobsData.forEach(job => {
-    if (job.application) applications.add(job.application);
-    if (job.subApplication) subApplications.add(job.subApplication);
-    if (job.smartFolder) smartFolders.add(job.smartFolder);
-  });
-
-  return {
-    applications: Array.from(applications).sort(),
-    subApplications: Array.from(subApplications).sort(),
-    smartFolders: Array.from(smartFolders).sort(),
-  };
-};
-
-export const getJobStatistics = async () => {
-  const jobsData = await getJobsData();
-
-  const stats = {
-    totalJobs: jobsData.length,
-    rootJobs: 0,
-    leafJobs: 0,
-    statusBreakdown: {
-      success: 0,
-      failed: 0,
-      running: 0,
-      waiting: 0,
-      idle: 0,
-    },
-    successRate: 0,
+  const parserOptions = {
+    ignoreAttributes: false,
+    attributeNamePrefix: '',
+    allowBooleanAttributes: true,
+    parseAttributeValue: false, 
+    trimValues: true,
+    ignoreDeclaration: true,
+    ignorePiTags: true,
   };
 
-  jobsData.forEach((job) => {
-    if (!job.inconds || job.inconds.length === 0) {
-      stats.rootJobs++;
-    }
-    if (!job.outconds || job.outconds.length === 0) {
-      stats.leafJobs++;
-    }
+  const parser = new XMLParser(parserOptions);
+  const result = parser.parse(xmlData);
 
-    const status = job.status || 'idle';
-    if (stats.statusBreakdown.hasOwnProperty(status)) {
-      stats.statusBreakdown[status]++;
-    }
-  });
-
-  const completed = stats.statusBreakdown.success + stats.statusBreakdown.failed;
-  if (completed > 0) {
-    stats.successRate = Math.round((stats.statusBreakdown.success / completed) * 100);
-  }
-
-  return stats;
+  return extractJobsFromParsedXml(result);
 };
 
-export const highlightDependencies = async (selectedJobId, nodes, edges) => {
-  if (!selectedJobId) {
-    return {
-      nodes: nodes.map(node => ({
-        ...node,
-        data: { ...node.data, isHighlighted: false, isDimmed: false },
-      })),
-      edges: edges.map(edge => ({
-        ...edge,
-        style: { ...edge.style, stroke: '#AEAEB2', strokeWidth: 2 },
-        animated: false,
-        data: { ...edge.data, isHighlighted: false },
-      })),
-    };
-  }
+const parseControlMXmlStreaming = (filePath) => {
+  return new Promise((resolve, reject) => {
+    const jobs = [];
+    const saxStream = sax.createStream(true, { trim: true, normalize: true });
 
-  const upstream = getUpstreamDependencies(selectedJobId, nodes);
-  const downstream = getDownstreamDependencies(selectedJobId, nodes);
-  const allRelated = new Set([...upstream, ...downstream]);
+    let currentJob = null;
+    let currentFolder = null;
+    let currentElement = null;
+    let folderCount = 0;
 
-  const highlightedNodes = nodes.map(node => ({
-    ...node,
-    data: {
-      ...node.data,
-      isHighlighted: allRelated.has(node.id),
-      isDimmed: !allRelated.has(node.id),
-    },
-  }));
+    saxStream.on('opentag', (node) => {
+      const tagName = node.name;
 
-  const highlightedEdges = edges.map(edge => {
-    const isHighlighted = allRelated.has(edge.source) && allRelated.has(edge.target);
-    return {
-      ...edge,
-      style: {
-        ...edge.style,
-        stroke: isHighlighted ? '#E0001B' : '#AEAEB2',
-        strokeWidth: isHighlighted ? 3 : 2,
-      },
-      animated: isHighlighted,
-      data: { ...edge.data, isHighlighted },
-    };
-  });
+      if (tagName === 'SMART_FOLDER') {
+        folderCount++;
+        currentFolder = node.attributes.FOLDER_NAME || 
+                       node.attributes.JOBNAME || 
+                       `Folder_${folderCount}`;
+      }
 
-  return { nodes: highlightedNodes, edges: highlightedEdges };
-};
+      if (tagName === 'JOB') {
 
-const transformJobsToFlowData = (jobsData) => {
-  const nodes = [];
-  const edges = [];
-  const edgeSet = new Set();
+        currentJob = {
+          jobname: node.attributes.JOBNAME || node.attributes.MEMNAME,
+          folderName: currentFolder,
+          inconds: [],
+          outconds: [],
+          status: getRandomStatus(),
 
-  jobsData.forEach((job) => {
-    nodes.push({
-      id: job.jobname,
-      type: 'jobNode',
-      data: {
-        label: job.jobname,
-        inconds: job.inconds || [],
-        outconds: job.outconds || [],
-        status: job.status || 'idle',
+          application: node.attributes.APPLICATION || 'N/A',
+          subApplication: node.attributes.SUB_APPLICATION || 'N/A',
+          smartFolder: currentFolder,
 
-        application: job.application || 'N/A',
-        subApplication: job.subApplication || 'N/A',
-        smartFolder: job.smartFolder || 'N/A',
+          metadata: {
+            tasktype: node.attributes.TASKTYPE,
+            description: node.attributes.DESCRIPTION,
+            parentFolder: node.attributes.PARENT_FOLDER,
+            runAs: node.attributes.RUN_AS,
+            platform: node.attributes.PLATFORM,
+            createdBy: node.attributes.CREATED_BY,
+          }
+        };
+      }
 
-        metadata: job.metadata || {},
-        isHighlighted: false,
-        isDimmed: false,
-      },
-      position: { x: 0, y: 0 },
+      if (tagName === 'INCOND' && currentJob) {
+        const condName = node.attributes.NAME;
+        if (condName) {
+          currentJob.inconds.push(condName);
+        }
+      }
+
+      if (tagName === 'OUTCOND' && currentJob) {
+        const condName = node.attributes.NAME;
+        const sign = node.attributes.SIGN;
+
+        if (condName && sign === '+') {
+          currentJob.outconds.push(condName);
+        }
+      }
     });
 
-    if (job.outconds && job.outconds.length > 0) {
-      job.outconds.forEach((outcond) => {
-        const edgeId = `${job.jobname}-${outcond}`;
-        if (!edgeSet.has(edgeId)) {
-          edges.push({
-            id: edgeId,
-            source: job.jobname,
-            target: outcond,
-            type: 'straight',
-            animated: false,
-            style: { stroke: '#AEAEB2', strokeWidth: 2 },
-            data: { isHighlighted: false },
-          });
-          edgeSet.add(edgeId);
-        }
-      });
-    }
-  });
+    saxStream.on('closetag', (tagName) => {
+      if (tagName === 'JOB' && currentJob) {
 
-  return { nodes, edges };
+        if (currentJob.jobname) {
+          jobs.push(currentJob);
+        }
+        currentJob = null;
+      }
+
+      if (tagName === 'SMART_FOLDER') {
+        if (jobs.length > 0 && jobs.length % 100 === 0) {
+          console.log(`[XML Parser] Streaming: Processed ${jobs.length} jobs...`);
+        }
+      }
+    });
+
+    saxStream.on('error', (error) => {
+      console.error('[XML Parser] Streaming error:', error);
+      reject(error);
+    });
+
+    saxStream.on('end', () => {
+      console.log(`[XML Parser] Streaming complete: ${jobs.length} jobs extracted`);
+      resolve(jobs);
+    });
+
+    const fileStream = fs.createReadStream(filePath, { encoding: 'utf8' });
+    fileStream.pipe(saxStream);
+
+    fileStream.on('error', (error) => {
+      reject(error);
+    });
+  });
 };
 
-export const getLayoutedElements = (nodes, edges, direction = 'TB') => {
-  console.log(`[Job Service] Starting layout for ${nodes.length} nodes and ${edges.length} edges`);
+const extractJobsFromParsedXml = (parsedXml) => {
+  const jobs = [];
+
+  const deftable = parsedXml.DEFTABLE;
+  if (!deftable) {
+    console.warn('[XML Parser] No DEFTABLE found in XML');
+    return jobs;
+  }
+
+  const folders = Array.isArray(deftable.SMART_FOLDER) 
+    ? deftable.SMART_FOLDER 
+    : [deftable.SMART_FOLDER].filter(Boolean);
+
+  console.log(`[XML Parser] Found ${folders.length} folders`);
+
+  folders.forEach((folder, folderIndex) => {
+    const folderName = folder.FOLDER_NAME || folder.JOBNAME || `Folder_${folderIndex}`;
+
+    const folderJobs = folder.JOB 
+      ? (Array.isArray(folder.JOB) ? folder.JOB : [folder.JOB])
+      : [];
+
+    console.log(`[XML Parser] Folder "${folderName}" has ${folderJobs.length} jobs`);
+
+    folderJobs.forEach((job) => {
+      const jobData = extractJobData(job, folderName);
+      if (jobData) {
+        jobs.push(jobData);
+      }
+    });
+  });
+
+  return jobs;
+};
+
+const extractJobData = (job, folderName) => {
+
+  const jobname = job.JOBNAME || job.MEMNAME;
+
+  if (!jobname) {
+    console.warn(`[XML Parser] Job without JOBNAME or MEMNAME found in folder "${folderName}"`);
+    return null;
+  }
+
+  const incondElements = job.INCOND 
+    ? (Array.isArray(job.INCOND) ? job.INCOND : [job.INCOND])
+    : [];
+
+  const outcondElements = job.OUTCOND 
+    ? (Array.isArray(job.OUTCOND) ? job.OUTCOND : [job.OUTCOND])
+    : [];
+
+  const inconds = incondElements
+    .map(incond => incond.NAME)
+    .filter(Boolean);
+
+  const outconds = outcondElements
+    .filter(outcond => outcond.SIGN === '+') 
+    .map(outcond => outcond.NAME)
+    .filter(Boolean);
+
+  return {
+    jobname,
+    folderName,
+    inconds,  
+    outconds, 
+    status: getRandomStatus(), 
+
+    application: job.APPLICATION || 'N/A',
+    subApplication: job.SUB_APPLICATION || 'N/A',
+    smartFolder: folderName,
+
+    metadata: {
+      tasktype: job.TASKTYPE,
+      description: job.DESCRIPTION,
+      parentFolder: job.PARENT_FOLDER,
+      runAs: job.RUN_AS,
+      platform: job.PLATFORM,
+      createdBy: job.CREATED_BY,
+    }
+  };
+};
+
+const extractJobNamesFromCondition = (conditionName) => {
+
+  const segments = conditionName.split('-');
+
+  const formatKeywords = new Set(['TO', 'ENDED', 'OK', 'COMPLETE', 'START', 'STOP', 'FINISH']);
+
+  return segments.filter(segment => {
+
+    if (!segment || segment.trim() === '') return false;
+
+    if (formatKeywords.has(segment.toUpperCase())) return false;
+
+    return /^[A-Z0-9_#]+$/i.test(segment);
+  });
+};
+
+const findMatchingJobNames = (segments, allJobNames) => {
+  const matches = [];
+
+  for (const segment of segments) {
+
+    if (allJobNames.has(segment)) {
+      matches.push(segment);
+      continue;
+    }
+
+    const lowerSegment = segment.toLowerCase();
+    for (const jobName of allJobNames) {
+      if (jobName.toLowerCase() === lowerSegment) {
+        matches.push(jobName);
+        break;
+      }
+    }
+
+    if (matches.length === 0 && segment.length >= 5) {
+      for (const jobName of allJobNames) {
+        if (jobName.includes(segment) || segment.includes(jobName)) {
+          matches.push(jobName);
+          break;
+        }
+      }
+    }
+  }
+
+  return matches;
+};
+
+export const resolveJobDependencies = (jobs) => {
+  console.log(`[XML Parser] Resolving dependencies for ${jobs.length} jobs`);
   const startTime = Date.now();
 
-  const nodeWidth = 200;
-  const nodeHeight = 80;
-  const horizontalSpacing = 80; 
-  const verticalSpacing = 120;  
+  console.log(`[XML Parser] Building job name index...`);
+  const allJobNames = new Set(jobs.map(job => job.jobname));
 
-  const childrenMap = new Map();
-  const parentsMap = new Map();
+  console.log(`[XML Parser] Building condition producers map...`);
+  const conditionProducers = new Map();
 
-  edges.forEach(edge => {
-    if (!childrenMap.has(edge.source)) {
-      childrenMap.set(edge.source, []);
-    }
-    childrenMap.get(edge.source).push(edge.target);
-
-    if (!parentsMap.has(edge.target)) {
-      parentsMap.set(edge.target, []);
-    }
-    parentsMap.get(edge.target).push(edge.source);
-  });
-
-  const rootNodes = nodes.filter(node => !parentsMap.has(node.id));
-  console.log(`[Job Service] Found ${rootNodes.length} root nodes`);
-
-  const levels = new Map();
-  const visited = new Set();
-  const queue = [];
-  const MAX_ITERATIONS = nodes.length * 10; 
-  let iterations = 0;
-
-  rootNodes.forEach(node => {
-    levels.set(node.id, 0);
-    visited.add(node.id);
-    queue.push(node.id);
-  });
-
-  while (queue.length > 0 && iterations < MAX_ITERATIONS) {
-    iterations++;
-    const nodeId = queue.shift();
-    const currentLevel = levels.get(nodeId);
-    const children = childrenMap.get(nodeId) || [];
-
-    children.forEach(childId => {
-      if (!visited.has(childId)) {
-        visited.add(childId);
-        levels.set(childId, currentLevel + 1);
-        queue.push(childId);
-      } else {
-
-        const existingLevel = levels.get(childId);
-        if (currentLevel + 1 > existingLevel) {
-          levels.set(childId, currentLevel + 1);
-          queue.push(childId); 
-        }
+  jobs.forEach(job => {
+    job.outconds.forEach(condName => {
+      if (!conditionProducers.has(condName)) {
+        conditionProducers.set(condName, []);
       }
+      conditionProducers.get(condName).push(job.jobname);
     });
-  }
+  });
 
-  if (iterations >= MAX_ITERATIONS) {
-    console.warn(`[Job Service] Layout BFS hit iteration limit (${MAX_ITERATIONS}). Possible circular dependencies.`);
-  }
+  console.log(`[XML Parser] Building condition consumers map...`);
+  const conditionConsumers = new Map();
 
-  nodes.forEach(node => {
-    if (!levels.has(node.id)) {
-      levels.set(node.id, 0);
+  jobs.forEach(job => {
+    job.inconds.forEach(condName => {
+      if (!conditionConsumers.has(condName)) {
+        conditionConsumers.set(condName, []);
+      }
+      conditionConsumers.get(condName).push(job.jobname);
+    });
+  });
+
+  console.log(`[XML Parser] Analyzing condition names for job references...`);
+  const conditionToJobs = new Map();
+
+  const allConditionNames = new Set([
+    ...conditionProducers.keys(),
+    ...conditionConsumers.keys()
+  ]);
+
+  console.log(`[XML Parser] Found ${allConditionNames.size} unique conditions to analyze`);
+
+  allConditionNames.forEach(condName => {
+    const segments = extractJobNamesFromCondition(condName);
+    const matchedJobs = findMatchingJobNames(segments, allJobNames);
+    if (matchedJobs.length > 0) {
+      conditionToJobs.set(condName, matchedJobs);
     }
   });
 
-  const levelValues = Array.from(levels.values());
-  const maxLevel = Math.max(...levelValues);
-  const minLevel = Math.min(...levelValues);
+  console.log(`[XML Parser] Found ${conditionToJobs.size} conditions with job references`);
 
-  const sortedLevelValues = [...levelValues].sort((a, b) => a - b);
-  const p95Index = Math.floor(sortedLevelValues.length * 0.95); 
-  const p95Level = sortedLevelValues[p95Index];
+  console.log(`[XML Parser] Resolving job dependencies...`);
+  const resolvedJobs = jobs.map(job => {
 
-  console.log(`[Job Service] Level stats: min=${minLevel}, max=${maxLevel}, 95th percentile=${p95Level}`);
+    const parentJobs = [];
 
-  const hasOutliers = maxLevel > p95Level * 2;
+    job.inconds.forEach(condName => {
 
-  if (hasOutliers) {
-    console.warn(`[Job Service] Detected outlier levels (max=${maxLevel} vs p95=${p95Level}), normalizing...`);
+      const producers = conditionProducers.get(condName) || [];
 
-    const compressionThreshold = Math.ceil(p95Level * 1.1); 
-    const maxReasonableLevel = compressionThreshold + 10; 
+      const validProducers = producers.filter(p => p !== job.jobname);
+      parentJobs.push(...validProducers);
 
-    nodes.forEach(node => {
-      const currentLevel = levels.get(node.id);
+      if (validProducers.length === 0) {
+        const jobsInCondition = conditionToJobs.get(condName) || [];
 
-      if (currentLevel <= compressionThreshold) {
-
-      } else {
-
-        const outlierRange = maxLevel - compressionThreshold;
-        const targetRange = maxReasonableLevel - compressionThreshold;
-
-        if (outlierRange > 0 && targetRange > 0) {
-          const relativePosition = (currentLevel - compressionThreshold) / outlierRange;
-          const compressedLevel = compressionThreshold + Math.ceil(relativePosition * targetRange);
-          levels.set(node.id, compressedLevel);
-        } else {
-
-          levels.set(node.id, compressionThreshold);
-        }
+        const validParents = jobsInCondition.filter(j => j !== job.jobname);
+        parentJobs.push(...validParents);
       }
     });
 
-    console.log(`[Job Service] Compressed outliers into range [${compressionThreshold}, ${maxReasonableLevel}]`);
-  } else {
+    const childJobs = [];
 
-    const maxReasonableLevel = Math.min(Math.ceil(nodes.length / 5), 50);
+    job.outconds.forEach(condName => {
 
-    if (maxLevel > maxReasonableLevel) {
-      console.warn(`[Job Service] Max level ${maxLevel} exceeds reasonable limit, compressing to ${maxReasonableLevel}`);
+      const consumers = conditionConsumers.get(condName) || [];
 
-      nodes.forEach(node => {
-        const currentLevel = levels.get(node.id);
-        const normalizedLevel = Math.floor((currentLevel / maxLevel) * maxReasonableLevel);
-        levels.set(node.id, normalizedLevel);
-      });
-    }
-  }
+      const validConsumers = consumers.filter(c => c !== job.jobname);
+      childJobs.push(...validConsumers);
 
-  const nodesByLevel = new Map();
-  nodes.forEach(node => {
-    const level = levels.get(node.id);
-    if (!nodesByLevel.has(level)) {
-      nodesByLevel.set(level, []);
-    }
-    nodesByLevel.get(level).push(node);
-  });
+      if (validConsumers.length === 0) {
+        const jobsInCondition = conditionToJobs.get(condName) || [];
 
-  const sortedLevels = Array.from(nodesByLevel.keys()).sort((a, b) => a - b);
-  console.log(`[Job Service] Jobs distributed across ${sortedLevels.length} levels (0-${Math.max(...sortedLevels)})`);
-
-  const levelDistribution = sortedLevels.map(level => ({
-    level,
-    count: nodesByLevel.get(level).length
-  }));
-  console.log(`[Job Service] Level distribution:`, levelDistribution.slice(0, 10).map(l => `L${l.level}:${l.count}`).join(', '));
-
-  const optimizeNodeOrdering = () => {
-
-    for (let i = 1; i < sortedLevels.length; i++) {
-      const level = sortedLevels[i];
-      const nodesAtLevel = nodesByLevel.get(level);
-      const prevLevel = sortedLevels[i - 1];
-      const prevNodes = nodesByLevel.get(prevLevel);
-
-      const prevPositions = new Map();
-      prevNodes.forEach((node, index) => {
-        prevPositions.set(node.id, index);
-      });
-
-      nodesAtLevel.forEach(node => {
-        const parents = parentsMap.get(node.id) || [];
-        if (parents.length > 0) {
-          const sum = parents.reduce((acc, parentId) => {
-            return acc + (prevPositions.get(parentId) || 0);
-          }, 0);
-          node._barycenter = sum / parents.length;
-        } else {
-          node._barycenter = Infinity; 
-        }
-      });
-
-      nodesAtLevel.sort((a, b) => {
-        if (a._barycenter === b._barycenter) {
-          return a.id.localeCompare(b.id); 
-        }
-        return a._barycenter - b._barycenter;
-      });
-    }
-
-    for (let i = sortedLevels.length - 2; i >= 0; i--) {
-      const level = sortedLevels[i];
-      const nodesAtLevel = nodesByLevel.get(level);
-      const nextLevel = sortedLevels[i + 1];
-      const nextNodes = nodesByLevel.get(nextLevel);
-
-      const nextPositions = new Map();
-      nextNodes.forEach((node, index) => {
-        nextPositions.set(node.id, index);
-      });
-
-      nodesAtLevel.forEach(node => {
-        const children = childrenMap.get(node.id) || [];
-        if (children.length > 0) {
-          const sum = children.reduce((acc, childId) => {
-            return acc + (nextPositions.get(childId) || 0);
-          }, 0);
-          node._barycenterBackward = sum / children.length;
-        } else {
-          node._barycenterBackward = Infinity;
-        }
-      });
-
-      nodesAtLevel.sort((a, b) => {
-        if (a._barycenterBackward === b._barycenterBackward) {
-          return a.id.localeCompare(b.id);
-        }
-        return a._barycenterBackward - b._barycenterBackward;
-      });
-    }
-  };
-
-  const optimizationPasses = nodes.length > 1000 ? 1 : 3;
-  console.log(`[Job Service] Running ${optimizationPasses} optimization passes`);
-
-  for (let pass = 0; pass < optimizationPasses; pass++) {
-    optimizeNodeOrdering();
-  }
-
-  const layoutedNodes = [];
-
-  sortedLevels.forEach(level => {
-    const nodesAtLevel = nodesByLevel.get(level);
-    const levelWidth = nodesAtLevel.length * nodeWidth + (nodesAtLevel.length - 1) * horizontalSpacing;
-    const startX = -levelWidth / 2;
-
-    nodesAtLevel.forEach((node, index) => {
-      const x = startX + index * (nodeWidth + horizontalSpacing) + nodeWidth / 2;
-      const y = level * (nodeHeight + verticalSpacing);
-
-      delete node._barycenter;
-      delete node._barycenterBackward;
-
-      layoutedNodes.push({
-        ...node,
-        position: {
-          x: x,
-          y: y
-        }
-      });
+        const validChildren = jobsInCondition.filter(j => j !== job.jobname);
+        childJobs.push(...validChildren);
+      }
     });
+
+    return {
+      jobname: job.jobname,
+      inconds: [...new Set(parentJobs)], 
+      outconds: [...new Set(childJobs)], 
+      status: job.status,
+
+      application: job.application,
+      subApplication: job.subApplication,
+      smartFolder: job.smartFolder,
+      metadata: job.metadata,
+
+      _originalInconds: job.inconds,
+      _originalOutconds: job.outconds,
+    };
   });
 
   const endTime = Date.now();
-  console.log(`[Job Service] Layout completed in ${endTime - startTime}ms`);
+  const resolvedCount = resolvedJobs.filter(j => j.inconds.length > 0 || j.outconds.length > 0).length;
+  console.log(`[XML Parser] Dependencies resolved in ${endTime - startTime}ms: ${resolvedCount}/${jobs.length} jobs have connections`);
 
-  return layoutedNodes;
-};
+  console.log(`[XML Parser] Checking for self-referencing conditions...`);
+  const selfRefJobs = jobs.filter(job => {
+    const commonConds = job.inconds.filter(cond => job.outconds.includes(cond));
+    return commonConds.length > 0;
+  });
 
-const getUpstreamDependencies = (jobId, nodes, visited = new Set()) => {
-  if (visited.has(jobId)) return visited;
-
-  visited.add(jobId);
-  const node = nodes.find(n => n.id === jobId);
-
-  if (node && node.data.inconds) {
-    node.data.inconds.forEach(parentId => {
-      getUpstreamDependencies(parentId, nodes, visited);
+  if (selfRefJobs.length > 0) {
+    console.warn(`[XML Parser] Found ${selfRefJobs.length} jobs with self-referencing conditions (same condition in INCOND and OUTCOND)`);
+    selfRefJobs.slice(0, 5).forEach(job => {
+      const commonConds = job.inconds.filter(cond => job.outconds.includes(cond));
+      console.warn(`  - ${job.jobname}: ${commonConds.join(', ')}`);
     });
+    if (selfRefJobs.length > 5) {
+      console.warn(`  ... and ${selfRefJobs.length - 5} more`);
+    }
   }
 
-  return visited;
-};
-
-const getDownstreamDependencies = (jobId, nodes, visited = new Set()) => {
-  if (visited.has(jobId)) return visited;
-
-  visited.add(jobId);
-  const node = nodes.find(n => n.id === jobId);
-
-  if (node && node.data.outconds) {
-    node.data.outconds.forEach(childId => {
-      getDownstreamDependencies(childId, nodes, visited);
+  console.log(`[XML Parser] Checking for circular dependencies...`);
+  const circularDeps = detectCircularDependencies(resolvedJobs);
+  if (circularDeps.length > 0) {
+    console.warn(`[XML Parser] Found ${circularDeps.length} circular dependency chains:`);
+    circularDeps.slice(0, 3).forEach(chain => {
+      console.warn(`  - ${chain.join(' -> ')}`);
     });
+    if (circularDeps.length > 3) {
+      console.warn(`  ... and ${circularDeps.length - 3} more`);
+    }
+  } else {
+    console.log(`[XML Parser] No circular dependencies detected`);
   }
 
-  return visited;
+  return resolvedJobs;
+};
+
+const detectCircularDependencies = (jobs) => {
+  const circularChains = [];
+  const visited = new Set();
+  const recursionStack = new Set();
+
+  const adjacency = new Map();
+  jobs.forEach(job => {
+    adjacency.set(job.jobname, job.outconds || []);
+  });
+
+  const dfs = (jobName, path = []) => {
+    if (recursionStack.has(jobName)) {
+
+      const cycleStart = path.indexOf(jobName);
+      if (cycleStart >= 0) {
+        const cycle = [...path.slice(cycleStart), jobName];
+        circularChains.push(cycle);
+      }
+      return;
+    }
+
+    if (visited.has(jobName)) {
+      return;
+    }
+
+    visited.add(jobName);
+    recursionStack.add(jobName);
+    path.push(jobName);
+
+    const children = adjacency.get(jobName) || [];
+    for (const child of children) {
+      dfs(child, [...path]);
+    }
+
+    recursionStack.delete(jobName);
+  };
+
+  jobs.forEach(job => {
+    if (!visited.has(job.jobname)) {
+      dfs(job.jobname);
+    }
+  });
+
+  return circularChains;
+};
+
+export const parseAndResolveControlMXml = async (filePath) => {
+  const jobs = await parseControlMXml(filePath);
+  const resolvedJobs = resolveJobDependencies(jobs);
+  return resolvedJobs;
+};
+
+export const getDefaultXmlFilePath = () => {
+  return path.join(process.cwd(), 'src', 'data', 'ctlm-aug.xml');
 };

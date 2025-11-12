@@ -337,9 +337,11 @@ export const resolveJobDependencies = (jobs) => {
     job.inconds.forEach(condName => {
 
       const producers = conditionProducers.get(condName) || [];
-      parentJobs.push(...producers);
 
-      if (producers.length === 0) {
+      const validProducers = producers.filter(p => p !== job.jobname);
+      parentJobs.push(...validProducers);
+
+      if (validProducers.length === 0) {
         const jobsInCondition = conditionToJobs.get(condName) || [];
 
         const validParents = jobsInCondition.filter(j => j !== job.jobname);
@@ -352,9 +354,11 @@ export const resolveJobDependencies = (jobs) => {
     job.outconds.forEach(condName => {
 
       const consumers = conditionConsumers.get(condName) || [];
-      childJobs.push(...consumers);
 
-      if (consumers.length === 0) {
+      const validConsumers = consumers.filter(c => c !== job.jobname);
+      childJobs.push(...validConsumers);
+
+      if (validConsumers.length === 0) {
         const jobsInCondition = conditionToJobs.get(condName) || [];
 
         const validChildren = jobsInCondition.filter(j => j !== job.jobname);
@@ -381,7 +385,80 @@ export const resolveJobDependencies = (jobs) => {
   const resolvedCount = resolvedJobs.filter(j => j.inconds.length > 0 || j.outconds.length > 0).length;
   console.log(`[XML Parser] Dependencies resolved: ${resolvedCount}/${jobs.length} jobs have connections`);
 
+  const selfRefJobs = jobs.filter(job => {
+    const commonConds = job.inconds.filter(cond => job.outconds.includes(cond));
+    return commonConds.length > 0;
+  });
+
+  if (selfRefJobs.length > 0) {
+    console.warn(`[XML Parser] Found ${selfRefJobs.length} jobs with self-referencing conditions (same condition in INCOND and OUTCOND)`);
+    selfRefJobs.slice(0, 5).forEach(job => {
+      const commonConds = job.inconds.filter(cond => job.outconds.includes(cond));
+      console.warn(`  - ${job.jobname}: ${commonConds.join(', ')}`);
+    });
+    if (selfRefJobs.length > 5) {
+      console.warn(`  ... and ${selfRefJobs.length - 5} more`);
+    }
+  }
+
+  const circularDeps = detectCircularDependencies(resolvedJobs);
+  if (circularDeps.length > 0) {
+    console.warn(`[XML Parser] Found ${circularDeps.length} circular dependency chains:`);
+    circularDeps.slice(0, 3).forEach(chain => {
+      console.warn(`  - ${chain.join(' -> ')}`);
+    });
+    if (circularDeps.length > 3) {
+      console.warn(`  ... and ${circularDeps.length - 3} more`);
+    }
+  }
+
   return resolvedJobs;
+};
+
+const detectCircularDependencies = (jobs) => {
+  const circularChains = [];
+  const visited = new Set();
+  const recursionStack = new Set();
+
+  const adjacency = new Map();
+  jobs.forEach(job => {
+    adjacency.set(job.jobname, job.outconds || []);
+  });
+
+  const dfs = (jobName, path = []) => {
+    if (recursionStack.has(jobName)) {
+
+      const cycleStart = path.indexOf(jobName);
+      if (cycleStart >= 0) {
+        const cycle = [...path.slice(cycleStart), jobName];
+        circularChains.push(cycle);
+      }
+      return;
+    }
+
+    if (visited.has(jobName)) {
+      return;
+    }
+
+    visited.add(jobName);
+    recursionStack.add(jobName);
+    path.push(jobName);
+
+    const children = adjacency.get(jobName) || [];
+    for (const child of children) {
+      dfs(child, [...path]);
+    }
+
+    recursionStack.delete(jobName);
+  };
+
+  jobs.forEach(job => {
+    if (!visited.has(job.jobname)) {
+      dfs(job.jobname);
+    }
+  });
+
+  return circularChains;
 };
 
 export const parseAndResolveControlMXml = async (filePath) => {

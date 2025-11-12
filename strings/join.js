@@ -349,7 +349,7 @@ export const getLayoutedElements = (nodes, edges, direction = 'TB') => {
   if (hasOutliers) {
     console.warn(`[Job Service] Detected outlier levels (max=${maxLevel} vs p95=${p95Level}), normalizing...`);
 
-    const compressionThreshold = p95Level + 5; 
+    const compressionThreshold = Math.ceil(p95Level * 1.1); 
     const maxReasonableLevel = compressionThreshold + 10; 
 
     nodes.forEach(node => {
@@ -357,15 +357,19 @@ export const getLayoutedElements = (nodes, edges, direction = 'TB') => {
 
       if (currentLevel <= compressionThreshold) {
 
-        levels.set(node.id, currentLevel);
       } else {
 
         const outlierRange = maxLevel - compressionThreshold;
         const targetRange = maxReasonableLevel - compressionThreshold;
-        const relativePosition = (currentLevel - compressionThreshold) / outlierRange;
-        const compressedLevel = compressionThreshold + Math.floor(relativePosition * targetRange);
 
-        levels.set(node.id, compressedLevel);
+        if (outlierRange > 0 && targetRange > 0) {
+          const relativePosition = (currentLevel - compressionThreshold) / outlierRange;
+          const compressedLevel = compressionThreshold + Math.ceil(relativePosition * targetRange);
+          levels.set(node.id, compressedLevel);
+        } else {
+
+          levels.set(node.id, compressionThreshold);
+        }
       }
     });
 

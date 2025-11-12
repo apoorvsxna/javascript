@@ -1,8 +1,395 @@
-function fruits(...f)
-{
-    let s = f.join(" "); // joins all elements of array into a string while separating them with the given string (here " ")
-    return s;
-}
+import fs from 'fs';
+import path from 'path';
+import { XMLParser } from 'fast-xml-parser';
+import sax from 'sax';
 
-let allFruits = fruits("apple", "banana", "melon");
-console.log(allFruits);
+const STREAMING_THRESHOLD = 100 * 1024 * 1024; 
+
+const JOB_STATUSES = ['success', 'failed', 'running', 'waiting', 'idle'];
+
+const getRandomStatus = () => {
+  return JOB_STATUSES[Math.floor(Math.random() * JOB_STATUSES.length)];
+};
+
+export const parseControlMXml = async (filePath) => {
+  try {
+    console.log(`[XML Parser] Starting to parse: ${filePath}`);
+    const startTime = Date.now();
+
+    const stats = await fs.promises.stat(filePath);
+    const fileSizeMB = (stats.size / (1024 * 1024)).toFixed(2);
+    console.log(`[XML Parser] File size: ${fileSizeMB}MB`);
+
+    let jobs;
+
+    if (stats.size >= STREAMING_THRESHOLD) {
+      console.log(`[XML Parser] Using streaming parser (file >= 100MB)`);
+      jobs = await parseControlMXmlStreaming(filePath);
+    } else {
+      console.log(`[XML Parser] Using fast parser (file < 100MB)`);
+      jobs = await parseControlMXmlFast(filePath);
+    }
+
+    const endTime = Date.now();
+    console.log(`[XML Parser] Parsed ${jobs.length} jobs in ${endTime - startTime}ms`);
+
+    return jobs;
+  } catch (error) {
+    console.error('[XML Parser] Error parsing XML:', error);
+    throw new Error(`Failed to parse XML file: ${error.message}`);
+  }
+};
+
+const parseControlMXmlFast = async (filePath) => {
+
+  const xmlData = await fs.promises.readFile(filePath, 'utf8');
+
+  const parserOptions = {
+    ignoreAttributes: false,
+    attributeNamePrefix: '',
+    allowBooleanAttributes: true,
+    parseAttributeValue: false, 
+    trimValues: true,
+    ignoreDeclaration: true,
+    ignorePiTags: true,
+  };
+
+  const parser = new XMLParser(parserOptions);
+  const result = parser.parse(xmlData);
+
+  return extractJobsFromParsedXml(result);
+};
+
+const parseControlMXmlStreaming = (filePath) => {
+  return new Promise((resolve, reject) => {
+    const jobs = [];
+    const saxStream = sax.createStream(true, { trim: true, normalize: true });
+
+    let currentJob = null;
+    let currentFolder = null;
+    let currentElement = null;
+    let folderCount = 0;
+
+    saxStream.on('opentag', (node) => {
+      const tagName = node.name;
+
+      if (tagName === 'SMART_FOLDER') {
+        folderCount++;
+        currentFolder = node.attributes.FOLDER_NAME || 
+                       node.attributes.JOBNAME || 
+                       `Folder_${folderCount}`;
+      }
+
+      if (tagName === 'JOB') {
+
+        currentJob = {
+          jobname: node.attributes.JOBNAME || node.attributes.MEMNAME,
+          folderName: currentFolder,
+          inconds: [],
+          outconds: [],
+          status: getRandomStatus(),
+
+          application: node.attributes.APPLICATION || 'N/A',
+          subApplication: node.attributes.SUB_APPLICATION || 'N/A',
+          smartFolder: currentFolder,
+
+          metadata: {
+            tasktype: node.attributes.TASKTYPE,
+            description: node.attributes.DESCRIPTION,
+            parentFolder: node.attributes.PARENT_FOLDER,
+            runAs: node.attributes.RUN_AS,
+            platform: node.attributes.PLATFORM,
+            createdBy: node.attributes.CREATED_BY,
+          }
+        };
+      }
+
+      if (tagName === 'INCOND' && currentJob) {
+        const condName = node.attributes.NAME;
+        if (condName) {
+          currentJob.inconds.push(condName);
+        }
+      }
+
+      if (tagName === 'OUTCOND' && currentJob) {
+        const condName = node.attributes.NAME;
+        const sign = node.attributes.SIGN;
+
+        if (condName && sign === '+') {
+          currentJob.outconds.push(condName);
+        }
+      }
+    });
+
+    saxStream.on('closetag', (tagName) => {
+      if (tagName === 'JOB' && currentJob) {
+
+        if (currentJob.jobname) {
+          jobs.push(currentJob);
+        }
+        currentJob = null;
+      }
+
+      if (tagName === 'SMART_FOLDER') {
+        if (jobs.length > 0 && jobs.length % 100 === 0) {
+          console.log(`[XML Parser] Streaming: Processed ${jobs.length} jobs...`);
+        }
+      }
+    });
+
+    saxStream.on('error', (error) => {
+      console.error('[XML Parser] Streaming error:', error);
+      reject(error);
+    });
+
+    saxStream.on('end', () => {
+      console.log(`[XML Parser] Streaming complete: ${jobs.length} jobs extracted`);
+      resolve(jobs);
+    });
+
+    const fileStream = fs.createReadStream(filePath, { encoding: 'utf8' });
+    fileStream.pipe(saxStream);
+
+    fileStream.on('error', (error) => {
+      reject(error);
+    });
+  });
+};
+
+const extractJobsFromParsedXml = (parsedXml) => {
+  const jobs = [];
+
+  const deftable = parsedXml.DEFTABLE;
+  if (!deftable) {
+    console.warn('[XML Parser] No DEFTABLE found in XML');
+    return jobs;
+  }
+
+  const folders = Array.isArray(deftable.SMART_FOLDER) 
+    ? deftable.SMART_FOLDER 
+    : [deftable.SMART_FOLDER].filter(Boolean);
+
+  console.log(`[XML Parser] Found ${folders.length} folders`);
+
+  folders.forEach((folder, folderIndex) => {
+    const folderName = folder.FOLDER_NAME || folder.JOBNAME || `Folder_${folderIndex}`;
+
+    const folderJobs = folder.JOB 
+      ? (Array.isArray(folder.JOB) ? folder.JOB : [folder.JOB])
+      : [];
+
+    console.log(`[XML Parser] Folder "${folderName}" has ${folderJobs.length} jobs`);
+
+    folderJobs.forEach((job) => {
+      const jobData = extractJobData(job, folderName);
+      if (jobData) {
+        jobs.push(jobData);
+      }
+    });
+  });
+
+  return jobs;
+};
+
+const extractJobData = (job, folderName) => {
+
+  const jobname = job.JOBNAME || job.MEMNAME;
+
+  if (!jobname) {
+    console.warn(`[XML Parser] Job without JOBNAME or MEMNAME found in folder "${folderName}"`);
+    return null;
+  }
+
+  const incondElements = job.INCOND 
+    ? (Array.isArray(job.INCOND) ? job.INCOND : [job.INCOND])
+    : [];
+
+  const outcondElements = job.OUTCOND 
+    ? (Array.isArray(job.OUTCOND) ? job.OUTCOND : [job.OUTCOND])
+    : [];
+
+  const inconds = incondElements
+    .map(incond => incond.NAME)
+    .filter(Boolean);
+
+  const outconds = outcondElements
+    .filter(outcond => outcond.SIGN === '+') 
+    .map(outcond => outcond.NAME)
+    .filter(Boolean);
+
+  return {
+    jobname,
+    folderName,
+    inconds,  
+    outconds, 
+    status: getRandomStatus(), 
+
+    application: job.APPLICATION || 'N/A',
+    subApplication: job.SUB_APPLICATION || 'N/A',
+    smartFolder: folderName,
+
+    metadata: {
+      tasktype: job.TASKTYPE,
+      description: job.DESCRIPTION,
+      parentFolder: job.PARENT_FOLDER,
+      runAs: job.RUN_AS,
+      platform: job.PLATFORM,
+      createdBy: job.CREATED_BY,
+    }
+  };
+};
+
+const extractJobNamesFromCondition = (conditionName) => {
+
+  const segments = conditionName.split('-');
+
+  const formatKeywords = new Set(['TO', 'ENDED', 'OK', 'COMPLETE', 'START', 'STOP', 'FINISH']);
+
+  return segments.filter(segment => {
+
+    if (!segment || segment.trim() === '') return false;
+
+    if (formatKeywords.has(segment.toUpperCase())) return false;
+
+    return /^[A-Z0-9_#]+$/i.test(segment);
+  });
+};
+
+const findMatchingJobNames = (segments, allJobNames) => {
+  const matches = [];
+
+  for (const segment of segments) {
+
+    if (allJobNames.has(segment)) {
+      matches.push(segment);
+      continue;
+    }
+
+    const lowerSegment = segment.toLowerCase();
+    for (const jobName of allJobNames) {
+      if (jobName.toLowerCase() === lowerSegment) {
+        matches.push(jobName);
+        break;
+      }
+    }
+
+    if (matches.length === 0 && segment.length >= 5) {
+      for (const jobName of allJobNames) {
+        if (jobName.includes(segment) || segment.includes(jobName)) {
+          matches.push(jobName);
+          break;
+        }
+      }
+    }
+  }
+
+  return matches;
+};
+
+export const resolveJobDependencies = (jobs) => {
+  console.log(`[XML Parser] Resolving dependencies for ${jobs.length} jobs`);
+
+  const allJobNames = new Set(jobs.map(job => job.jobname));
+
+  const conditionProducers = new Map();
+
+  jobs.forEach(job => {
+    job.outconds.forEach(condName => {
+      if (!conditionProducers.has(condName)) {
+        conditionProducers.set(condName, []);
+      }
+      conditionProducers.get(condName).push(job.jobname);
+    });
+  });
+
+  const conditionConsumers = new Map();
+
+  jobs.forEach(job => {
+    job.inconds.forEach(condName => {
+      if (!conditionConsumers.has(condName)) {
+        conditionConsumers.set(condName, []);
+      }
+      conditionConsumers.get(condName).push(job.jobname);
+    });
+  });
+
+  const conditionToJobs = new Map();
+
+  const allConditionNames = new Set([
+    ...conditionProducers.keys(),
+    ...conditionConsumers.keys()
+  ]);
+
+  allConditionNames.forEach(condName => {
+    const segments = extractJobNamesFromCondition(condName);
+    const matchedJobs = findMatchingJobNames(segments, allJobNames);
+    if (matchedJobs.length > 0) {
+      conditionToJobs.set(condName, matchedJobs);
+    }
+  });
+
+  console.log(`[XML Parser] Found ${conditionToJobs.size} conditions with job references`);
+
+  const resolvedJobs = jobs.map(job => {
+
+    const parentJobs = [];
+
+    job.inconds.forEach(condName => {
+
+      const producers = conditionProducers.get(condName) || [];
+      parentJobs.push(...producers);
+
+      if (producers.length === 0) {
+        const jobsInCondition = conditionToJobs.get(condName) || [];
+
+        const validParents = jobsInCondition.filter(j => j !== job.jobname);
+        parentJobs.push(...validParents);
+      }
+    });
+
+    const childJobs = [];
+
+    job.outconds.forEach(condName => {
+
+      const consumers = conditionConsumers.get(condName) || [];
+      childJobs.push(...consumers);
+
+      if (consumers.length === 0) {
+        const jobsInCondition = conditionToJobs.get(condName) || [];
+
+        const validChildren = jobsInCondition.filter(j => j !== job.jobname);
+        childJobs.push(...validChildren);
+      }
+    });
+
+    return {
+      jobname: job.jobname,
+      inconds: [...new Set(parentJobs)], 
+      outconds: [...new Set(childJobs)], 
+      status: job.status,
+
+      application: job.application,
+      subApplication: job.subApplication,
+      smartFolder: job.smartFolder,
+      metadata: job.metadata,
+
+      _originalInconds: job.inconds,
+      _originalOutconds: job.outconds,
+    };
+  });
+
+  const resolvedCount = resolvedJobs.filter(j => j.inconds.length > 0 || j.outconds.length > 0).length;
+  console.log(`[XML Parser] Dependencies resolved: ${resolvedCount}/${jobs.length} jobs have connections`);
+
+  return resolvedJobs;
+};
+
+export const parseAndResolveControlMXml = async (filePath) => {
+  const jobs = await parseControlMXml(filePath);
+  const resolvedJobs = resolveJobDependencies(jobs);
+  return resolvedJobs;
+};
+
+export const getDefaultXmlFilePath = () => {
+  return path.join(process.cwd(), 'src', 'data', 'ctlm-aug.xml');
+};
